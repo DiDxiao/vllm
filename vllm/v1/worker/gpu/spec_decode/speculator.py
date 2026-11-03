@@ -49,7 +49,7 @@ class BaseSpeculator(ABC):
         num_sampled: torch.Tensor,
         # [num_reqs]
         num_rejected: torch.Tensor,
-        # [max_num_reqs]
+        # [max_num_reqs, 1]
         last_sampled: torch.Tensor,
         # [max_num_reqs]
         next_prefill_tokens: torch.Tensor,
@@ -63,6 +63,16 @@ class BaseSpeculator(ABC):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        pass
+
+    def init_request(self, req_idx: int, all_token_ids: list[int]) -> None:
+        """Offer a new request's full token history at admission.
+
+        Called before the request's first step so speculators that keep
+        per-request history-derived state can seed it from the real tokens;
+        ``all_token_ids`` is the admission snapshot (prompt, plus any partial
+        output when resuming).
+        """
         pass
 
     def remove_request(self, req_idx: int) -> None:

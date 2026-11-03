@@ -817,6 +817,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             req_index = self.req_states.req_id_to_index[req_id]
 
+            if self.speculator is not None:
+                # Seed speculator-side history state (e.g. the Domino GRU
+                # warm-up ring) from the admission token snapshot.
+                self.speculator.init_request(
+                    req_index, new_req_data.prefill_token_ids
+                )
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 

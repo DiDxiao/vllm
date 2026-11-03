@@ -1733,14 +1733,18 @@ class Qwen3DominoModel(nn.Module):
         # Committed tokens left of the anchor fed to the correction GRU
         # before the walk; the value is baked into the checkpoint and must
         # match training (SpecForge dflash_config.correction_warmup_len).
-        self.correction_warmup_len = int(
-            dflash_config.get("correction_warmup_len", 0)
-        )
-        if self.correction_warmup_len < 0:
+        warmup_len = dflash_config.get("correction_warmup_len", 0)
+        if isinstance(warmup_len, bool) or not isinstance(warmup_len, int):
             raise ValueError(
-                "dflash_config.correction_warmup_len must be >= 0, got "
-                f"{self.correction_warmup_len}"
+                "dflash_config.correction_warmup_len must be an int, got "
+                f"{warmup_len!r}"
             )
+        if not 0 <= warmup_len <= 128:
+            raise ValueError(
+                "dflash_config.correction_warmup_len must be in [0, 128], "
+                f"got {warmup_len}"
+            )
+        self.correction_warmup_len = warmup_len
         self.mask_token_id = dflash_config.get("mask_token_id")
 
         self.embed_tokens = VocabParallelEmbedding(
