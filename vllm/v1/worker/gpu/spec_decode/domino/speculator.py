@@ -66,6 +66,17 @@ class DominoSpeculator(DSparkSpeculator):
             device=device,
         )
 
+        # GRU warm-up over the committed tokens left of the anchor
+        # (dflash_config.correction_warmup_len, resolved in load_draft_model).
+        # The ring is keyed by request-state slot; the active-order seed ids
+        # are refreshed each propose for the captured walk to read.
+        self.correction_warmup_len = 0
+        self._warmup_ring: torch.Tensor | None = None
+        self._warmup_seed_ids: torch.Tensor | None = None
+        self._warmup_seen: torch.Tensor | None = None
+        self._warmup_prev_anchor: torch.Tensor | None = None
+        self._warmup_last_active_pos: torch.Tensor | None = None
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Let DFlash's graph manager decide: FULL / FULL_DECODE_ONLY is
         # captured as an ACL graph on Ascend, while PIECEWISE / NONE stays
@@ -89,6 +100,26 @@ class DominoSpeculator(DSparkSpeculator):
         from vllm.model_executor.models.qwen3_domino import load_domino_model
 
         model = load_domino_model(target_model, self.vllm_config)
+        self.correction_warmup_len = int(
+            getattr(model, "correction_warmup_len", 0)
+        )
+        if self.correction_warmup_len > 0:
+            n = self.correction_warmup_len
+            self._warmup_ring = torch.zeros(
+                self.max_num_reqs, n, dtype=torch.int64, device=self.device
+            )
+            self._warmup_seed_ids = torch.zeros(
+                self.max_num_reqs, n, dtype=torch.int64, device=self.device
+            )
+            self._warmup_seen = torch.zeros(
+                self.max_num_reqs, dtype=torch.bool, device=self.device
+            )
+            self._warmup_prev_anchor = torch.zeros(
+                self.max_num_reqs, dtype=torch.int64, device=self.device
+            )
+            self._warmup_last_active_pos = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int64, device=self.device
+            )
         if self.draft_logits is not None and model.draft_id_to_target_id is not None:
             d2t = model.draft_id_to_target_id
             self._d2t_scatter_index = (
@@ -101,6 +132,94 @@ class DominoSpeculator(DSparkSpeculator):
                 device=self.device,
             )
         return model
+
+    def remove_request(self, req_idx: int) -> None:
+        # A freed state slot must not leak its ring into the next request.
+        if self._warmup_seen is not None:
+            self._warmup_seen[req_idx] = False
+            self._warmup_last_active_pos[req_idx] = -1
+
+    def _update_warmup_ring(
+        self,
+        num_reqs: int,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+    ) -> None:
+        new_rows, state, anchor = _advance_warmup_ring(
+            ring=self._warmup_ring,
+            seen=self._warmup_seen,
+            prev_anchor=self._warmup_prev_anchor,
+            last_active_pos=self._warmup_last_active_pos,
+            draft_tokens=self.draft_tokens,
+            idx_mapping=idx_mapping,
+            num_reqs=num_reqs,
+            num_sampled=num_sampled,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            warmup_len=self.correction_warmup_len,
+            num_speculative_steps=self.num_speculative_steps,
+            device=self.device,
+        )
+        self._warmup_ring[state] = new_rows
+        self._warmup_seed_ids[:num_reqs] = new_rows
+        self._warmup_seen[state] = True
+        self._warmup_prev_anchor[state] = anchor
+
+    def propose(
+        self,
+        input_batch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
+    ) -> torch.Tensor:
+        if self.correction_warmup_len > 0 and not dummy_run:
+            self._update_warmup_ring(
+                input_batch.num_reqs,
+                input_batch.idx_mapping,
+                num_sampled,
+                last_sampled,
+                next_prefill_tokens,
+            )
+        draft_tokens = super().propose(
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            num_tokens_across_dp,
+            dummy_run,
+            skip_attn_for_dummy_run,
+            mm_inputs,
+            is_profile=is_profile,
+        )
+        if self.correction_warmup_len > 0 and not dummy_run:
+            # The walk just rewrote draft_tokens in this round's active
+            # order; remember it so the next update maps state -> drafts.
+            state = input_batch.idx_mapping[: input_batch.num_reqs].to(torch.int64)
+            self._warmup_last_active_pos[state] = torch.arange(
+                input_batch.num_reqs, device=self.device
+            )
+        return draft_tokens
 
     def _sample_step(
         self,
@@ -183,7 +302,12 @@ class DominoSpeculator(DSparkSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_i
             prefix_ids[:, 1 + i] = draft_i
 
-        prefix_embeds = self.model.embed_tokens(prefix_ids)
+        seed_ids = prefix_ids
+        if self.correction_warmup_len > 0:
+            seed_ids = torch.cat(
+                [self._warmup_seed_ids[:num_reqs], prefix_ids], dim=1
+            )
+        prefix_embeds = self.model.embed_tokens(seed_ids)
         _, gru_hidden = self.model.domino_gru_forward(prefix_embeds)
 
         sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
@@ -230,3 +354,70 @@ class DominoSpeculator(DSparkSpeculator):
             cudagraph_runtime_mode,
         )
         self._sample_sequential(num_reqs, head_hidden)
+
+
+def _advance_warmup_ring(
+    *,
+    ring: torch.Tensor,
+    seen: torch.Tensor,
+    prev_anchor: torch.Tensor,
+    last_active_pos: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_reqs: int,
+    num_sampled: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    warmup_len: int,
+    num_speculative_steps: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Advance the committed-token ring for the active requests.
+
+    ``num_sampled`` is THIS round's commit count (accepted drafts plus the
+    bonus), zeroed for chunked-prefill rows; delta == 0 appends nothing so
+    uncommitted anchors never enter the ring. The first sighting of a request
+    broadcasts the anchor, matching training's sequence-start clamp (the
+    prompt tail never reaches the ring). Returns the new ring rows, the state
+    indices they belong to, and each row's anchor.
+    """
+    state = idx_mapping[:num_reqs].to(torch.int64)
+    num_sampled = num_sampled[:num_reqs].to(torch.int64)
+    first_sighting = ~seen[state]
+    anchor = torch.where(
+        num_sampled > 0,
+        last_sampled[state].to(torch.int64),
+        next_prefill_tokens[state].to(torch.int64),
+    )
+
+    ring_rows = ring[state]
+    ring_rows = torch.where(
+        first_sighting.unsqueeze(1),
+        anchor.unsqueeze(1).expand(num_reqs, warmup_len),
+        ring_rows,
+    )
+
+    # Newly committed stream since the last propose, in order:
+    # [previous anchor, accepted drafts]. A request absent from the previous
+    # round has no valid draft row to read, and one that skipped a verify can
+    # commit at most the bonus, so its accepted-draft mask stays empty.
+    delta = torch.where(first_sighting, torch.zeros_like(num_sampled), num_sampled)
+    last_pos = last_active_pos[state]
+    has_last = last_pos >= 0
+    last_drafts = draft_tokens[last_pos.clamp(min=0)].to(torch.int64)
+    appended = torch.empty(
+        num_reqs, 1 + num_speculative_steps, dtype=torch.int64, device=device
+    )
+    appended[:, 0] = torch.where(has_last, prev_anchor[state], anchor)
+    slot = torch.arange(1, 1 + num_speculative_steps, device=device)
+    accept_mask = (delta.view(-1, 1) > slot.view(1, -1)) & has_last.view(-1, 1)
+    appended[:, 1:] = torch.where(accept_mask, last_drafts, anchor.unsqueeze(1))
+
+    # Last warmup_len entries of [old ring, appended]: the valid window
+    # starts at delta.
+    combined = torch.cat([ring_rows, appended], dim=1)
+    gather_idx = delta.view(-1, 1) + torch.arange(warmup_len, device=device).view(
+        1, -1
+    )
+    new_rows = torch.gather(combined, 1, gather_idx)
+    return new_rows, state, anchor

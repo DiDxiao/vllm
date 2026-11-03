@@ -1730,6 +1730,17 @@ class Qwen3DominoModel(nn.Module):
                 "shared_emb_readout requires out_proj_after_norm=true"
             )
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
+        # Committed tokens left of the anchor fed to the correction GRU
+        # before the walk; the value is baked into the checkpoint and must
+        # match training (SpecForge dflash_config.correction_warmup_len).
+        self.correction_warmup_len = int(
+            dflash_config.get("correction_warmup_len", 0)
+        )
+        if self.correction_warmup_len < 0:
+            raise ValueError(
+                "dflash_config.correction_warmup_len must be >= 0, got "
+                f"{self.correction_warmup_len}"
+            )
         self.mask_token_id = dflash_config.get("mask_token_id")
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -3074,6 +3085,10 @@ class Qwen3DominoForCausalLM(nn.Module):
     @property
     def pure_draft_prefix_len(self) -> int:
         return self.model.pure_draft_prefix_len
+
+    @property
+    def correction_warmup_len(self) -> int:
+        return self.model.correction_warmup_len
 
     @property
     def num_sinks(self) -> int:

@@ -65,6 +65,14 @@ class BaseSpeculator(ABC):
     ) -> torch.Tensor:
         pass
 
+    def remove_request(self, req_idx: int) -> None:
+        """Drop any per-request-state-slot scratch a speculator keeps.
+
+        Called by the model runner when a request finishes or is preempted,
+        before the state slot can be reused by a new request.
+        """
+        pass
+
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):

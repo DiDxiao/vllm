@@ -769,6 +769,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.encoder_cache.remove_request(req_id)
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
+        if self.speculator is not None:
+            self.speculator.remove_request(req_idx)
         self.lora_state.remove_request(req_id)
         return True
 
