@@ -7,7 +7,9 @@ lightweight causal correction head.  The correction head consists of:
 
   * a prefix GRU that summarizes the already-sampled draft prefix, and
   * ``embed_proj``, a low-rank residual logit correction
-    ``Linear(hidden + gru) -> emb_dim -> vocab``.
+    ``Linear(hidden + gru) -> emb_dim -> vocab``.  With
+    ``dflash_config.correction_swiglu`` the bottleneck is SwiGLU-gated
+    instead of SiLU (``embed_proj.0`` doubles to ``2 * emb_dim`` rows).
 
 The checkpoint format follows SpecForge's ``DFlashDraftModel`` with
 ``dflash_config.projector_type == "domino"``.  Both target-fusion modes are
@@ -1729,6 +1731,28 @@ class Qwen3DominoModel(nn.Module):
             raise ValueError(
                 "shared_emb_readout requires out_proj_after_norm=true"
             )
+        # Mirrors SpecForge's dflash_config.correction_swiglu: the legacy
+        # two-path bottleneck is SwiGLU-gated (embed_proj.0 doubles to
+        # 2*emb_dim rows, gate half first) instead of SiLU. The doubled fc1
+        # is a different checkpoint parameterization, so the flag must match
+        # the trained weights; load_weights rejects mismatches by shape.
+        self.correction_swiglu = bool(
+            dflash_config.get("correction_swiglu", False)
+        )
+        if self.correction_swiglu:
+            if self.shared_emb_readout:
+                raise ValueError(
+                    "correction_swiglu requires shared_emb_readout=false "
+                    "(the shared readout is a pure linear add in emb space)"
+                )
+            if not dflash_config.get("use_embed_proj", True):
+                raise ValueError(
+                    "correction_swiglu requires use_embed_proj=true"
+                )
+            if dflash_config.get("use_hidden_proj", False):
+                raise ValueError(
+                    "correction_swiglu is not compatible with use_hidden_proj"
+                )
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         # Committed tokens left of the anchor fed to the correction GRU
         # before the walk; the value is baked into the checkpoint and must
@@ -1928,17 +1952,22 @@ class Qwen3DominoModel(nn.Module):
                     else self.target_hidden_size
                 )
                 in_dim = z_dim + self.gru_hidden_dim
+                # SwiGLU doubles fc1 to [gate; up] rows; embed_proj.2 still
+                # consumes emb_dim.
+                fc1_out = (
+                    2 * self.emb_dim if self.correction_swiglu else self.emb_dim
+                )
                 self.embed_proj = nn.Sequential(
                     ReplicatedLinear(
                         in_dim,
-                        self.emb_dim,
+                        fc1_out,
                         bias=False,
                         params_dtype=vllm_config.model_config.dtype,
                         quant_config=self.quant_config,
                         prefix=maybe_prefix(prefix, "embed_proj.0"),
                         return_bias=False,
                     ),
-                    nn.SiLU(),
+                    SiluAndMul() if self.correction_swiglu else nn.SiLU(),
                     ParallelLMHead(
                         self.vocab_size,
                         self.emb_dim,
@@ -3364,6 +3393,29 @@ class Qwen3DominoForCausalLM(nn.Module):
                 "dflash_config.shared_emb_readout is off; enable the flag "
                 "in the draft config."
             )
+        # correction_swiglu doubles embed_proj.0 to [2*emb_dim, in_dim]; a
+        # shape that disagrees with the flag means the checkpoint was trained
+        # with the other activation and would silently produce wrong logits.
+        fc1 = model_weights.get("model.embed_proj.0.weight")
+        if (
+            fc1 is not None
+            and self.model.embed_proj is not None
+            and fc1.is_floating_point()
+        ):
+            fc1_rows = int(fc1.shape[0])
+            want_rows = (
+                2 * int(self.model.emb_dim)
+                if self.model.correction_swiglu
+                else int(self.model.emb_dim)
+            )
+            if fc1_rows != want_rows:
+                raise ValueError(
+                    f"dflash_config.correction_swiglu="
+                    f"{self.model.correction_swiglu} but embed_proj.0 has "
+                    f"{fc1_rows} rows ({want_rows} expected); swiglu and "
+                    "silu checkpoints are different parameterizations — "
+                    "set the flag to match the trained checkpoint"
+                )
 
         found_vha = fold_vha_weights(
             model_weights,

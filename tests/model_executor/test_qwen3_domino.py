@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn as nn
 
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -1086,3 +1088,56 @@ def test_precompute_rejects_the_wrong_context_layout() -> None:
         Qwen3DominoModel.precompute_and_store_context_kv(
             flare_model, torch.randn(3, flare_model.context_hidden_size), None
         )
+
+
+def _legacy_correction_draft(embed_proj, V: int):
+    draft = object.__new__(Qwen3DominoForCausalLM)
+    draft.model = SimpleNamespace(
+        shared_emb_readout=False,
+        embed_proj=embed_proj,
+        hidden_proj=None,
+    )
+    draft.logits_processor = LogitsProcessor(V)
+    return draft
+
+
+def _tiny_correction_head(device, swiglu: bool):
+    H, G, M, V = 8, 12, 4, 32
+    fc1_out = 2 * M if swiglu else M
+    embed_proj = nn.Sequential(
+        ReplicatedLinear(
+            H + G, fc1_out, bias=False, return_bias=False,
+            prefix="model.embed_proj.0",
+        ),
+        SiluAndMul() if swiglu else nn.SiLU(),
+        ParallelLMHead(V, M, prefix="model.embed_proj.2"),
+    )
+    with torch.no_grad():
+        embed_proj[0].weight.normal_()
+        embed_proj[2].weight.normal_()
+    return embed_proj, H, G, M, V
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+def test_correction_bias_matches_manual_activation(
+    default_vllm_config, dist_init, device
+) -> None:
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+
+    for swiglu in (False, True):
+        torch.manual_seed(0)
+        embed_proj, H, G, M, V = _tiny_correction_head(device, swiglu)
+        draft = _legacy_correction_draft(embed_proj, V)
+
+        features = torch.randn(5, H + G)
+        bias = draft.correction_bias(features)
+
+        assert embed_proj[0].weight.shape[0] == (2 * M if swiglu else M)
+        u = features @ embed_proj[0].weight.t()
+        act = SiluAndMul()(u) if swiglu else F.silu(u)
+        # [:, :V]: ParallelLMHead may pad the vocab dimension
+        manual = (act @ embed_proj[2].weight.t())[:, :V]
+        torch.testing.assert_close(bias, manual, atol=1e-4, rtol=1e-4)
