@@ -184,28 +184,36 @@ def test_update_warmup_ring_end_to_end_through_prefill_and_decode():
         spec._warmup_ring[3], torch.tensor([11, 12, 13])
     )
 
-    # Chunked-prefill propose rounds are inert.
+    # Chunked-prefill propose rounds are inert; next_prefill_tokens holds a
+    # mid-prompt token of the next chunk ([max_num_reqs] contract).
+    next_prefill = torch.zeros(MAX_REQS, dtype=torch.int32)
+    next_prefill[3] = 96
     for _ in range(3):
         spec._update_warmup_ring(
             1,
             idx_mapping,
             torch.tensor([0], dtype=torch.int32),
-            spec._warmup_seed_ids.new_zeros(MAX_REQS, 1),
-            torch.tensor([96], dtype=torch.int32),
+            torch.zeros(MAX_REQS, 1, dtype=torch.int64),
+            next_prefill,
         )
+    # Inert rows carry their own ring (the admission history); the mid-prompt
+    # token never enters, and the slot is not yet marked seen.
     assert torch.equal(
         spec._warmup_seed_ids[0], torch.tensor([11, 12, 13])
     )
     assert not spec._warmup_seen[3]
+    assert spec._warmup_inited[3]
 
     # First decode round: keep the seeded history, mark seen.
     spec._warmup_last_drafts[3] = torch.tensor([7, 8, 11, 12])
+    last_sampled = torch.zeros(MAX_REQS, 1, dtype=torch.int64)
+    last_sampled[3, 0] = 100
     spec._update_warmup_ring(
         1,
         idx_mapping,
         torch.tensor([1], dtype=torch.int32),
-        torch.tensor([[0], [0], [0], [100]], dtype=torch.int64),
-        torch.tensor([0], dtype=torch.int32),
+        last_sampled,
+        next_prefill,
     )
     assert torch.equal(
         spec._warmup_seed_ids[0], torch.tensor([11, 12, 13])
@@ -215,12 +223,13 @@ def test_update_warmup_ring_end_to_end_through_prefill_and_decode():
 
     # Steady round with two accepted drafts.
     spec._warmup_last_drafts[3] = torch.tensor([7, 8, 11, 12])
+    last_sampled[3, 0] = 200
     spec._update_warmup_ring(
         1,
         idx_mapping,
         torch.tensor([3], dtype=torch.int32),
-        torch.tensor([[0], [0], [0], [200]], dtype=torch.int64),
-        torch.tensor([0], dtype=torch.int32),
+        last_sampled,
+        next_prefill,
     )
     assert torch.equal(
         spec._warmup_seed_ids[0], torch.tensor([100, 7, 8])

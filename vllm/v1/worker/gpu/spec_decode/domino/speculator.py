@@ -190,13 +190,11 @@ class DominoSpeculator(DSparkSpeculator):
             device=self.device,
         )
         self._warmup_ring[state] = new_rows
-        # Inert rows (num_sampled == 0, e.g. chunked prefill) keep their
-        # previous seed so the discarded prefill drafts never touch the ring.
-        self._warmup_seed_ids[:num_reqs] = torch.where(
-            active.unsqueeze(1),
-            new_rows,
-            self._warmup_seed_ids[:num_reqs],
-        )
+        # Every active row's seed equals its own ring (inert rows return
+        # their ring unchanged, i.e. the admission history). The seed buffer
+        # is active-position indexed, so stale rows from a previous round's
+        # ordering must never survive here.
+        self._warmup_seed_ids[:num_reqs] = new_rows
         active_state = state[active]
         self._warmup_seen[active_state] = True
         self._warmup_prev_anchor[active_state] = anchor[active]
